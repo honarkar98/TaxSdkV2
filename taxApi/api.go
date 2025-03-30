@@ -1,6 +1,7 @@
 package taxApi
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -9,8 +10,11 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/lestrrat-go/jwx/v2/jwa"
+	"github.com/lestrrat-go/jwx/v2/jwe"
 	"io"
 	"log"
 	"net/http"
@@ -27,7 +31,7 @@ func NewJwsService() *JwsService {
 }
 
 // Create generates a JWS token
-func (js *JwsService) Create(privateKey *rsa.PrivateKey, header map[string]interface{}, payload map[string]interface{}) (string, error) {
+func (js *JwsService) Create(privateKey *rsa.PrivateKey, header map[string]interface{}, payload interface{}) (string, error) {
 	// Validate algorithm
 	if alg, ok := header["alg"].(string); !ok || alg != "RS256" {
 		return "", errors.New("cannot create JWS, the supported 'alg' is (RS256)")
@@ -75,6 +79,7 @@ type MoadianClient struct {
 	clientID          string
 	token             string
 	httpClient        *http.Client
+	TaxPublicKey      string
 }
 
 // NewMoadianClient creates a new Moadian API client
@@ -227,6 +232,83 @@ func (mc *MoadianClient) RequestToken() (string, error) {
 
 	mc.token = token
 	return token, nil
+}
+
+// SendInvoice sends invoice packets to the Moadian API
+func (mc *MoadianClient) SendInvoice(ctx context.Context, invoicePackets []map[string]interface{}) (interface{}, error) {
+
+	mc.RequestToken()
+
+	// Prepare request body
+	requestBody, err := json.Marshal(invoicePackets)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal invoice packets: %w", err)
+	}
+
+	// Create request
+	req, err := http.NewRequestWithContext(
+		ctx,
+		"POST",
+		mc.apiBaseURL+"/invoice",
+		bytes.NewBuffer(requestBody),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Set headers
+	req.Header.Set("Authorization", "Bearer "+mc.token)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+
+	// Send request
+	resp, err := mc.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Handle response
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	/*if resp.StatusCode >= 400 {
+		var apiErr APIError
+		if json.Unmarshal(body, &apiErr) == nil {
+			apiErr.StatusCode = resp.StatusCode
+			return nil, apiErr
+		}
+		return nil, fmt.Errorf("API error: %s (status %d)", string(body), resp.StatusCode)
+	}*/
+
+	if resp.StatusCode == http.StatusOK {
+		var taxpayer SendInvoiceResponse
+		err := json.Unmarshal(body, &taxpayer)
+		if err != nil {
+			panic(err)
+		}
+		taxpayer.StatusCode = resp.StatusCode
+		return &taxpayer, nil
+	} else if resp.StatusCode >= 400 && resp.StatusCode <= 500 {
+		var taxError TaxRequestErrorResponse
+		err := json.Unmarshal(body, &taxError)
+		if err != nil {
+			panic(err)
+		}
+		taxError.StatusCode = resp.StatusCode
+		return &taxError, errors.New("fiscal-information request failed")
+	} else {
+		return nil, fmt.Errorf("unexpected status code: %d , data:   %s", resp.StatusCode, string(body))
+	}
+
+	var result interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	return result, nil
 }
 
 // GetFiscalInformation retrieves fiscal information
@@ -391,6 +473,132 @@ func (mc *MoadianClient) GetInvoiceStatusWithTaxId(ctx context.Context, taxIDs [
 	}
 }
 
+func (mc *MoadianClient) GetInvoiceStatusByReferenceId(ctx context.Context, referenceIds []string, startTime time.Time, endTime time.Time) (interface{}, error) {
+	params := url.Values{}
+	for _, refID := range referenceIds {
+		params.Add("referenceIds", refID)
+	}
+
+	// Add time parameters with proper formatting
+	if !startTime.IsZero() {
+		params.Set("start", startTime.Format(time.RFC3339Nano))
+	}
+	if !endTime.IsZero() {
+		params.Set("end", endTime.Format(time.RFC3339Nano))
+	}
+
+	//var result InvoiceStatusResponse
+	body, resp, err := mc.DoRequest(
+		context.Background(),
+		"GET",
+		"/inquiry-by-reference-id",
+		params,
+		nil,
+	)
+	fmt.Printf(string(body), resp, err)
+
+	if err != nil {
+		panic(err)
+	}
+
+	if resp.StatusCode == http.StatusOK {
+		var taxpayer []InquiryByReferenceIdResponse
+		err := json.Unmarshal(body, &taxpayer)
+		if err != nil {
+			panic(err)
+		}
+		return &taxpayer, nil
+	} else if resp.StatusCode >= 400 && resp.StatusCode <= 500 {
+		var taxError TaxRequestErrorResponse
+		err := json.Unmarshal(body, &taxError)
+		if err != nil {
+			panic(err)
+		}
+		taxError.StatusCode = resp.StatusCode
+		return &taxError, errors.New("fiscal-information request failed")
+	} else {
+		return nil, fmt.Errorf("unexpected status code: %d , data:   %s", resp.StatusCode, string(body))
+	}
+}
+
+func (mc *MoadianClient) GetInvoiceStatusByUid(ctx context.Context, uids []string, fiscalId string, startTime time.Time, endTime time.Time) (interface{}, error) {
+	params := url.Values{}
+	for _, uid := range uids {
+		params.Add("uidList", uid)
+	}
+
+	// Add time parameters with proper formatting
+	if !startTime.IsZero() {
+		params.Set("start", startTime.Format(time.RFC3339Nano))
+	}
+	if !endTime.IsZero() {
+		params.Set("end", endTime.Format(time.RFC3339Nano))
+	}
+
+	params.Set("fiscalId", fiscalId)
+	//var result InvoiceStatusResponse
+	body, resp, err := mc.DoRequest(
+		context.Background(),
+		"GET",
+		"/inquiry-by-uid",
+		params,
+		nil,
+	)
+	fmt.Printf(string(body), resp, err)
+
+	if err != nil {
+		panic(err)
+	}
+
+	if resp.StatusCode == http.StatusOK {
+		var taxpayer []InquiryByReferenceIdResponse
+		err := json.Unmarshal(body, &taxpayer)
+		if err != nil {
+			panic(err)
+		}
+		return &taxpayer, nil
+	} else if resp.StatusCode >= 400 && resp.StatusCode <= 500 {
+		var taxError TaxRequestErrorResponse
+		err := json.Unmarshal(body, &taxError)
+		if err != nil {
+			panic(err)
+		}
+		taxError.StatusCode = resp.StatusCode
+		return &taxError, errors.New("fiscal-information request failed")
+	} else {
+		return nil, fmt.Errorf("unexpected status code: %d , data:   %s", resp.StatusCode, string(body))
+	}
+}
+
+func (mc *MoadianClient) GetServerInformation() (interface{}, error) {
+
+	body, resp, err := mc.DoRequest(context.Background(), "GET", "/server-information", url.Values{}, nil)
+
+	if err != nil {
+		panic(err)
+	}
+
+	if resp.StatusCode == http.StatusOK {
+		var taxpayer ServerInformationResponse
+		err := json.Unmarshal(body, &taxpayer)
+		if err != nil {
+			panic(err)
+		}
+		taxpayer.StatusCode = resp.StatusCode
+		return &taxpayer, nil
+	} else if resp.StatusCode >= 400 && resp.StatusCode <= 500 {
+		var taxError TaxRequestErrorResponse
+		err := json.Unmarshal(body, &taxError)
+		if err != nil {
+			panic(err)
+		}
+		taxError.StatusCode = resp.StatusCode
+		return &taxError, errors.New("fiscal-information request failed")
+	} else {
+		return nil, fmt.Errorf("unexpected status code: %d , data:   %s", resp.StatusCode, string(body))
+	}
+}
+
 // NonceResponse represents the nonce response structure
 type NonceResponse struct {
 	Nonce   string    `json:"nonce"`
@@ -427,4 +635,166 @@ type InquiryByTaxId struct {
 	InvoiceStatus  *string `json:"invoiceStatus"`
 	Article6Status *string `json:"article6Status"`
 	Error          *string `json:"error"`
+}
+
+type InquiryByReferenceIdResponse struct {
+	ReferenceNumber string  `json:"referenceNumber"`
+	Uid             *string `json:"uid"`
+	Status          string  `json:"status"`
+	Data            *struct {
+		Error []struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+		Warning []struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"warning"`
+		Success bool `json:"success"`
+	} `json:"data"`
+	PacketType *string     `json:"packetType"`
+	FiscalId   *string     `json:"fiscalId"`
+	Sign       interface{} `json:"sign"`
+}
+
+type ServerInformationResponse struct {
+	ServerTime int64 `json:"serverTime"`
+	PublicKeys []struct {
+		Key       string `json:"key"`
+		Id        string `json:"id"`
+		Algorithm string `json:"algorithm"`
+		Purpose   int    `json:"purpose"`
+	} `json:"publicKeys"`
+	StatusCode int `json:"statusCode"`
+}
+
+func (mc *MoadianClient) CreateInvoicePacket(jwsPayload InvoiceDto) (map[string]interface{}, error) {
+	// Generate UUID
+	//uid, err := uuid.NewRandom()
+	//if err != nil {
+	//	return nil, fmt.Errorf("failed to generate UUID: %w", err)
+	//}
+
+	// Get server public keys if not available
+	if len(mc.TaxPublicKey) == 0 {
+		if serverInformation, err := mc.GetServerInformation(); err != nil {
+			mc.TaxPublicKey = serverInformation.(ServerInformationResponse).PublicKeys[0].Key
+			return nil, fmt.Errorf("failed to get server info: %w", err)
+		}
+	}
+
+	serverInformation, _ := mc.GetServerInformation()
+	// Find RSA public key
+	var serverPubKey *rsa.PublicKey
+	var serverKeyID string
+	for _, v := range serverInformation.(*ServerInformationResponse).PublicKeys {
+		if v.Algorithm == "RSA" {
+			cc, _ := parsePublicKey(v.Key)
+			serverPubKey = cc
+			serverKeyID = v.Id
+			break
+		}
+	}
+	if serverPubKey == nil {
+		return nil, errors.New("server public key algorithm not supported. supported algorithm is (RSA)")
+	}
+
+	// Create JWS
+	jwsHeader := map[string]interface{}{
+		"alg":  "RS256",
+		"typ":  "jose",
+		"x5c":  []string{mc.certificateBase64},
+		"sigT": time.Now().UTC().Format(time.RFC3339),
+		"crit": []string{"sigT"},
+		"cty":  "text/plain",
+	}
+
+	invoiceJWS, err := NewJwsService().Create(mc.privateKey, jwsHeader, jwsPayload)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to create JWS: %w", err)
+	}
+
+	// Create JWE
+	/*jweHeader := map[string]interface{}{
+		"alg": "RSA-OAEP-256",
+		"enc": "A256GCM",
+		"kid": serverKeyID,
+	}*/
+	jweHeaders := jwe.NewHeaders()
+
+	if err := jweHeaders.Set("alg", jwa.RSA_OAEP_256); err != nil {
+		return nil, fmt.Errorf("failed to set JWE algorithm: %w", err)
+	}
+	if err := jweHeaders.Set("enc", jwa.A256GCM); err != nil {
+		return nil, fmt.Errorf("failed to set JWE encryption: %w", err)
+	}
+	if err := jweHeaders.Set("kid", serverKeyID); err != nil {
+		return nil, fmt.Errorf("failed to set JWE key ID: %w", err)
+	}
+	//encrypted, err := jwe.Encrypt([]byte(jwsStr), jwe.WithKey(jwa.RSA_OAEP_256, key, jwe.WithProtectedHeaders(jweHeaders)),
+
+	encryptedPayload, err := jwe.Encrypt(
+		[]byte(invoiceJWS),
+		jwe.WithKey(jwa.RSA_OAEP_256, serverPubKey),
+		jwe.WithContentEncryption(jwa.A256GCM),
+		//jwe.WithKeySet()
+		jwe.WithProtectedHeaders(jweHeaders),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create JWE: %w", err)
+	}
+
+	// Build final packet
+	data := map[string]interface{}{
+		"payload": encryptedPayload,
+		"header": map[string]interface{}{
+			"requestTraceId": "cf019c26-f235-11ed-a05b-0242ac120003",
+			"fiscalId":       mc.clientID,
+		},
+	}
+
+	return data, nil
+}
+
+func parsePublicKey(keyStr string) (*rsa.PublicKey, error) {
+	// Try decoding as base64 first
+	keyBytes := []byte(keyStr)
+	if isBase64Encoded(keyStr) {
+		decoded, err := base64.StdEncoding.DecodeString(keyStr)
+		if err != nil {
+			return nil, fmt.Errorf("base64 decode failed: %w", err)
+		}
+		keyBytes = decoded
+	}
+
+	// Try parsing as PEM first
+	block, _ := pem.Decode(keyBytes)
+	if block != nil {
+		keyBytes = block.Bytes
+	}
+
+	// Try parsing as DER encoded PKIX public key
+	pub, err := x509.ParsePKIXPublicKey(keyBytes)
+	if err == nil {
+		rsaPub, ok := pub.(*rsa.PublicKey)
+		if !ok {
+			return nil, errors.New("key is not an RSA public key")
+		}
+		return rsaPub, nil
+	}
+
+	// Try parsing as DER encoded PKCS1 public key
+	return x509.ParsePKCS1PublicKey(keyBytes)
+}
+
+type SendInvoiceResponse struct {
+	Timestamp int64 `json:"timestamp"`
+	Result    []struct {
+		Uid             string      `json:"uid"`
+		PacketType      interface{} `json:"packetType"`
+		ReferenceNumber string      `json:"referenceNumber"`
+		Data            interface{} `json:"data"`
+	} `json:"result"`
+	StatusCode int `json:"statusCode"`
 }
